@@ -17,6 +17,7 @@ import random
 import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset
+import pickle
 
 import wenet.dataset.processor as processor
 from wenet.utils.file_utils import read_lists
@@ -29,9 +30,11 @@ class Processor(IterableDataset):
         self.f = f
         self.args = args
         self.kw = kw
+        self.epo = 0
 
     def set_epoch(self, epoch):
         self.source.set_epoch(epoch)
+        self.epo = epoch
 
     def __iter__(self):
         """ Return an iterator over the source dataset processed by the
@@ -39,6 +42,8 @@ class Processor(IterableDataset):
         """
         assert self.source is not None
         assert callable(self.f)
+        if self.f.__name__ == "padding":
+            return self.f(iter(self.source), self.epo, *self.args, **self.kw)
         return self.f(iter(self.source), *self.args, **self.kw)
 
     def apply(self, f):
@@ -167,16 +172,12 @@ def Dataset(data_type,
 
     spec_aug = conf.get('spec_aug', True)
     spec_sub = conf.get('spec_sub', False)
-    spec_trim = conf.get('spec_trim', False)
     if spec_aug:
         spec_aug_conf = conf.get('spec_aug_conf', {})
         dataset = Processor(dataset, processor.spec_aug, **spec_aug_conf)
     if spec_sub:
         spec_sub_conf = conf.get('spec_sub_conf', {})
         dataset = Processor(dataset, processor.spec_sub, **spec_sub_conf)
-    if spec_trim:
-        spec_trim_conf = conf.get('spec_trim_conf', {})
-        dataset = Processor(dataset, processor.spec_trim, **spec_trim_conf)
 
     if shuffle:
         shuffle_conf = conf.get('shuffle_conf', {})
@@ -189,5 +190,57 @@ def Dataset(data_type,
 
     batch_conf = conf.get('batch_conf', {})
     dataset = Processor(dataset, processor.batch, **batch_conf)
-    dataset = Processor(dataset, processor.padding)
+
+    bpe_dict_file = conf.get('bpe_dict', None)
+    context_dict_file = conf.get('context_dict', None)
+    alignments_file = conf.get('alignments', None)
+
+    bpe_set = {-1}
+    context_dic = {}
+    alignments_dict = {}
+
+    if bpe_dict_file != None:
+        with open(bpe_dict_file) as f:
+            dic_lines = f.readlines()
+            for dic_line in dic_lines:
+                if '▁' in dic_line.strip():
+                    bpe_set.add(int(dic_line.strip().split()[1]))
+
+
+    if context_dict_file != None:
+        print(context_dict_file)
+        with open(context_dict_file,'rb') as f:
+            context_dic = pickle.load(f)
+
+    # if alignments_file != None:
+    #     f = open(alignments_file, "r")
+    #     line = f.readline()
+    #     cnt = 0
+    #     while line:
+    #         cnt += 1
+    #         if cnt % 100000 == 0:
+    #             print("read alignments ", cnt)
+    #         line = line.strip().split()
+    #         utt = line[0]
+    #         wp = line[1].split(",")
+    #         ti = line[2].split(",")
+    #         if len(wp) != len(ti):
+    #             line = f.readline()
+    #             continue
+    #         alignments_dict[utt] = {}
+    #         start = []
+    #         end = []
+    #         for i in range(len(wp)):
+    #             if wp[i] == "":
+    #                 continue
+    #             start.append(int(float(ti[i - 1]) / 0.04) + 1)
+    #             end.append(int(float(ti[i]) / 0.04))
+    #         alignments_dict[utt]["start"] = start
+    #         alignments_dict[utt]["end"] = end
+    #         line = f.readline()
+
+
+    context_mode = conf.get('context_mode',1)
+    pad_conf = conf.get('pad_conf', {})
+    dataset = Processor(dataset, processor.padding, context_mode=context_mode, bpe_set=bpe_set, context_dic=context_dic, alignments_dict=alignments_dict,**pad_conf)
     return dataset

@@ -20,10 +20,13 @@ import tarfile
 from subprocess import PIPE, Popen
 from urllib.parse import urlparse
 
+import numpy as np
+
 import torch
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 from torch.nn.utils.rnn import pad_sequence
+import random
 
 AUDIO_FORMAT_SETS = set(['flac', 'mp3', 'm4a', 'ogg', 'opus', 'wav', 'wma'])
 
@@ -49,7 +52,7 @@ def url_opener(data):
                 stream = open(url, 'rb')
             # network file, such as HTTP(HDFS/OSS/S3)/HTTPS/SCP
             else:
-                cmd = f'wget -q -O - {url}'
+                cmd = f'curl -s -L {url}'
                 process = Popen(cmd, shell=True, stdout=PIPE)
                 sample.update(process=process)
                 stream = process.stdout
@@ -446,7 +449,6 @@ def spec_aug(data, num_t_mask=2, num_f_mask=2, max_t=50, max_f=10, max_w=80):
 def spec_sub(data, max_t=20, num_t_sub=3):
     """ Do spec substitute
         Inplace operation
-        ref: U2++, section 3.2.3 [https://arxiv.org/abs/2106.05642]
 
         Args:
             data: Iterable[{key, feat, label}]
@@ -470,29 +472,6 @@ def spec_sub(data, max_t=20, num_t_sub=3):
             pos = random.randint(0, start)
             y[start:end, :] = x[start - pos:end - pos, :]
         sample['feat'] = y
-        yield sample
-
-
-def spec_trim(data, max_t=20):
-    """ Trim tailing frames. Inplace operation.
-        ref: TrimTail [https://arxiv.org/abs/2211.00522]
-
-        Args:
-            data: Iterable[{key, feat, label}]
-            max_t: max width of length trimming
-
-        Returns
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'feat' in sample
-        x = sample['feat']
-        assert isinstance(x, torch.Tensor)
-        max_frames = x.size(0)
-        length = random.randint(1, max_t)
-        if length < max_frames / 2:
-            y = x.clone().detach()[:max_frames - length]
-            sample['feat'] = y
         yield sample
 
 
@@ -608,7 +587,108 @@ def batch(data, batch_type='static', batch_size=16, max_frames_in_batch=12000):
         logging.fatal('Unsupported batch type {}'.format(batch_type))
 
 
-def padding(data):
+context_list_over_all = []
+def maintain_context_list(add_list=None,list_size=200):
+    global context_list_over_all
+    if len(context_list_over_all) + len(add_list) <= list_size:
+        context_list_over_all.extend(add_list)
+    elif len(add_list) >= list_size:
+        context_list_over_all = add_list
+    else:
+        cut_num = len(context_list_over_all) + len(add_list) - list_size
+        context_list_over_all.extend(add_list)
+        context_list_over_all = context_list_over_all[cut_num:]
+    return context_list_over_all
+# old
+def context_generate(key_list, context_dic, label=None, context_len_min=1, context_len_max=4, context_mode=0, bpe_set=None, context_list_valid=None, context_list_test=None, pos_per_bartch=1.0, epoch = 0):
+    """ generate context word
+
+        Args:
+            data: Iterable[List[{key, feat, label}]]
+            len_min: min length of context word
+            len_max: max length of context word
+            mode: mode for generate(0:None,1:random select,2:generate from file)
+            file: context_list file
+
+        Returns
+            Iterable[Tuple(context,context_length)]
+    """
+    context_list = []
+    context_end = []
+    random_label_withcontext = []
+    random_label_withoutcontext =[]
+    if context_mode == 2 or context_mode == 3:
+        if context_mode == 2:
+            context_list_file = context_list_valid
+        if context_mode == 3:
+            context_list_file = context_list_test 
+        # f = open(context_list_file)
+        # file_obj = f.readlines()
+        # for item in file_obj:
+        #     context_list.append(torch.tensor([int(id) for id in item.split()]))
+        # f.close()
+    if context_mode == 4:
+        raw_list = context_dic[key_list[0]]
+        for raw_line in raw_list:
+            context_list.append(torch.tensor(raw_line))
+    if context_mode == 1:
+        for x in label:
+            assert isinstance(x, torch.Tensor)
+            y = x.clone().detach()
+            cur_len = len(y)
+            st_list = [] 
+            for index, ele in enumerate(y):
+                if int(ele) in bpe_set:
+                    st_list.append(index) 
+            word_num = len(st_list)
+            st_list.append(cur_len) # 每个label中词的开始index
+
+            # random_len = random.randint(min(word_num, context_len_min), min(word_num, context_len_max)) #随机热词长度
+            # random_index = random.randint(0, len(st_list) - random_len - 1) # 随机热词开始index
+            # st_index = st_list[random_index] #热词开始index
+            # en_index = st_list[random_index + random_len] #热词结束index
+            # cur_phrase = y[st_index: en_index] #热词
+            # context_list.append(cur_phrase) #热词添加到热词列表
+
+            st_bef = []
+            en_bef = []
+            # num_context = random.randint(0, 3)
+            num_context = 3
+            for _ in range(0, num_context):
+                random_len = random.randint(min(word_num, context_len_min), min(word_num, context_len_max)) #随机热词长度
+                random_index = random.randint(0, len(st_list) - random_len - 1) # 随机热词开始index
+                st_index = st_list[random_index] #热词开始index
+                en_index = st_list[random_index + random_len] #热词结束index
+                cur_phrase = y[st_index: en_index] #热词
+                flag = True
+                for i in range(len(st_bef)):
+                    if st_index >= st_bef[i] and st_index < en_bef[i]:
+                        flag = False
+                    elif en_index > st_bef[i] and en_index <= en_bef[i]:
+                        flag = False
+                    elif st_index < st_bef[i] and en_index > en_bef[i]:
+                        flag = False
+                if flag == True:
+                    context_list.append(cur_phrase) #热词添加到热词列表
+                    st_bef.append(st_index)
+                    en_bef.append(en_index)
+
+        context_num = int(len(context_list) * pos_per_bartch)
+        list_size = 30
+        # if epoch > 40:
+        #     list_size = min(30 + (epoch - 40) * 10, 300)
+        context_list = maintain_context_list(add_list=context_list, list_size=list_size)[::-1]
+    if context_mode == 0:
+        return None,None
+    context_list.insert(0, torch.tensor([0]))
+    context_lengths = torch.tensor([x.size(0) for x in context_list],dtype=torch.int32)
+    context_list_padded = pad_sequence(context_list,
+                                    batch_first=True,
+                                    padding_value=-1)
+    
+    return context_list_padded, context_lengths, context_end, random_label_withcontext, random_label_withoutcontext, context_list
+
+def padding(data, epoch, context_len_min=2, context_len_max=4, context_mode=0, bpe_set=None, context_dic=None, alignments_dict=None, context_list_valid=None, context_list_test=None, pos_per_batch=1.0):
     """ Padding the data into training data
 
         Args:
@@ -621,6 +701,11 @@ def padding(data):
         assert isinstance(sample, list)
         feats_length = torch.tensor([x['feat'].size(0) for x in sample],
                                     dtype=torch.int32)
+        key_list = [x['key'] for x in sample]
+        # fout = open("/home/work_nfs5_ssd/kxhuang/res.txt", "a")
+        # for x in sample:
+        #     fout.write(x['key'] + " " + ' '.join(str(i) for i in x['label']) + "\n")
+        # fout.close()
         order = torch.argsort(feats_length, descending=True)
         feats_lengths = torch.tensor(
             [sample[i]['feat'].size(0) for i in order], dtype=torch.int32)
@@ -629,15 +714,52 @@ def padding(data):
         sorted_labels = [
             torch.tensor(sample[i]['label'], dtype=torch.int64) for i in order
         ]
+        padded_context_list,context_lengths,context_end_idx,random_label_withcontext,random_label_withoutcontext, context_list = context_generate(key_list, context_dic, sorted_labels,context_len_min,context_len_max,context_mode,bpe_set,context_list_valid,context_list_test, epoch = epoch)
+        
         label_lengths = torch.tensor([x.size(0) for x in sorted_labels],
-                                     dtype=torch.int32)
+                                    dtype=torch.int32)
 
         padded_feats = pad_sequence(sorted_feats,
                                     batch_first=True,
                                     padding_value=0)
         padding_labels = pad_sequence(sorted_labels,
-                                      batch_first=True,
-                                      padding_value=-1)
+                                    batch_first=True,
+                                    padding_value=-1)
+        padding_context_labels, context_label_lengths, context_decoder_labels_padded = context_label_generate(sorted_labels, context_list)
 
         yield (sorted_keys, padded_feats, padding_labels, feats_lengths,
-               label_lengths)
+            label_lengths,padded_context_list,context_lengths, padding_context_labels, context_label_lengths, context_decoder_labels_padded)
+
+def context_label_generate(label=[], context_list=[]):
+    """ generate context label
+
+        Args:
+
+        Returns
+    """
+    context_labels = []
+    context_length = []
+    context_decoder_labels = []
+    for x in label:
+        cur_len = len(x)
+        context_label = []
+        context_decoder_label = torch.zeros_like(x)
+        context_left = 0
+        for i in range(cur_len):
+            for j in range(1, len(context_list)):
+                if i + len(context_list[j]) > cur_len:
+                    continue
+                if x[i:i + len(context_list[j])].equal(context_list[j]):
+                    context_decoder_label[i:i + len(context_list[j])] = context_list[j]
+                    context_left = max(context_left, len(context_list[j]))
+            if context_left > 0:
+                context_label.append(x[i])
+                context_left -= 1
+        context_length.append(len(context_label))
+        context_label = torch.tensor(context_label, dtype=torch.int32)
+        context_labels.append(context_label)
+        context_decoder_labels.append(context_decoder_label)
+    context_labels_padded = pad_sequence(context_labels, batch_first=True, padding_value=0)
+    context_lengths = torch.tensor(context_length, dtype=torch.int32)
+    context_decoder_labels_padded = pad_sequence(context_decoder_labels, batch_first=True, padding_value=-1)
+    return context_labels_padded, context_lengths, context_decoder_labels_padded

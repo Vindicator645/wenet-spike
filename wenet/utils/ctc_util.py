@@ -1,16 +1,5 @@
-# Copyright (c) 2021 Mobvoi Inc (Binbin Zhang, Di Wu)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2021 Mobvoi Inc. All Rights Reserved.
+# Author: binbinzhang@mobvoi.com (Di Wu)
 
 import numpy as np
 import torch
@@ -71,8 +60,8 @@ def forced_align(ctc_probs: torch.Tensor,
         log_alpha[-1, len(y_insert_blank) - 1],
         log_alpha[-1, len(y_insert_blank) - 2]
     ])
-    final_state = [len(y_insert_blank) - 1, len(y_insert_blank) - 2]
-    state_seq[-1] = final_state[torch.argmax(candidates)]
+    prev_state = [len(y_insert_blank) - 1, len(y_insert_blank) - 2]
+    state_seq[-1] = prev_state[torch.argmax(candidates)]
     for t in range(ctc_probs.size(0) - 2, -1, -1):
         state_seq[t] = state_path[t + 1, state_seq[t + 1, 0]]
 

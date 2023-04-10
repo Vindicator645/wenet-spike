@@ -1,19 +1,8 @@
-# Copyright (c) 2019 Shigeki Karita
-#               2020 Mobvoi Inc (Binbin Zhang)
-#               2022 Xingchen Song (sxc19@mails.tsinghua.edu.cn)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+# Copyright 2019 Shigeki Karita
+#  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 """Multi-Head Attention layer definition."""
 
 import math
@@ -110,7 +99,6 @@ class MultiHeadedAttention(nn.Module):
         #   2. jit (16/-1, -1/-1, 16/0, 16/4)
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
-
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
         x = (x.transpose(1, 2).contiguous().view(n_batch, -1,
@@ -155,6 +143,7 @@ class MultiHeadedAttention(nn.Module):
                 and `head * d_k == size`
 
         """
+        
         q, k, v = self.forward_qkv(query, key, value)
 
         # NOTE(xcsong):
@@ -185,6 +174,11 @@ class MultiHeadedAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         return self.forward_attention(v, scores, mask), new_cache
 
+    def forward_score(self, query: torch.Tensor, key:torch.Tensor, value:torch.Tensor):
+        q, k, v = self.forward_qkv(query, key, value)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        scores = scores[:, 0, :, :].view(scores.shape[0], scores.shape[2], -1)
+        return torch.softmax(scores, dim=-1)
 
 class RelPositionMultiHeadedAttention(MultiHeadedAttention):
     """Multi-Head Attention layer with relative position encoding.

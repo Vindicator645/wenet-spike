@@ -1,24 +1,15 @@
-# Copyright (c) 2020 Mobvoi Inc. (authors: Binbin Zhang, Di Wu)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# Modified from ESPnet(https://github.com/espnet/espnet)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+# Copyright 2021 Mobvoi Inc. All Rights Reserved.
+# Author: di.wu@mobvoi.com (DI WU)
 """ConvolutionModule definition."""
 
 from typing import Tuple
 
 import torch
 from torch import nn
+from typeguard import check_argument_types
 
 
 class ConvolutionModule(nn.Module):
@@ -36,6 +27,7 @@ class ConvolutionModule(nn.Module):
             kernel_size (int): Kernel size of conv layers.
             causal (int): Whether use causal convolution or not
         """
+        assert check_argument_types()
         super().__init__()
 
         self.pointwise_conv1 = nn.Conv1d(
@@ -120,7 +112,7 @@ class ConvolutionModule(nn.Module):
             assert (x.size(2) > self.lorder)
             new_cache = x[:, :, -self.lorder:]
         else:
-            # It's better we just return None if no cache is required,
+            # It's better we just return None if no cache is requried,
             # However, for JIT export, here we just fake one tensor instead of
             # None.
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)

@@ -20,8 +20,8 @@ import os
 import torch
 import yaml
 
+from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint
-from wenet.utils.init_model import init_model
 
 
 def get_args():
@@ -43,8 +43,8 @@ def main():
 
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_model(configs)
-    print(model)
+    model = init_asr_model(configs)
+    # print(model)
 
     load_checkpoint(model, args.checkpoint)
     # Export jit torch script model

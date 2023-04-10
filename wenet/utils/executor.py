@@ -1,20 +1,8 @@
-# Copyright (c) 2020 Mobvoi Inc (Binbin Zhang)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2019 Mobvoi Inc. All Rights Reserved.
+# Author: binbinzhang@mobvoi.com (Binbin Zhang)
 
 import logging
 from contextlib import nullcontext
-
 # if your python version < 3.7 use the below one
 # from contextlib import suppress as nullcontext
 import torch
@@ -22,7 +10,6 @@ from torch.nn.utils import clip_grad_norm_
 
 
 class Executor:
-
     def __init__(self):
         self.step = 0
 
@@ -52,11 +39,19 @@ class Executor:
         num_seen_utts = 0
         with model_context():
             for batch_idx, batch in enumerate(data_loader):
-                key, feats, target, feats_lengths, target_lengths = batch
+                key, feats, target, feats_lengths, target_lengths, context_list, context_lengths, context_label, context_label_lengths, context_decoder_label = batch
+                # import pdb;pdb.set_trace()
+                # if batch_idx == 100:
+                #     import pdb;pdb.set_trace()
                 feats = feats.to(device)
                 target = target.to(device)
                 feats_lengths = feats_lengths.to(device)
                 target_lengths = target_lengths.to(device)
+                context_list = context_list.to(device)
+                context_lengths = context_lengths.to(device)
+                context_label = context_label.to(device)
+                context_label_lengths = context_label_lengths.to(device)
+                context_decoder_label = context_decoder_label.to(device)
                 num_utts = target_lengths.size(0)
                 if num_utts == 0:
                     continue
@@ -75,13 +70,15 @@ class Executor:
                     # The more details about amp can be found in
                     # https://pytorch.org/docs/stable/notes/amp_examples.html
                     with torch.cuda.amp.autocast(scaler is not None):
-                        loss_dict = model(feats, feats_lengths, target,
-                                          target_lengths)
-                        loss = loss_dict['loss'] / accum_grad
+                        # import pdb;pdb.set_trace()
+                        loss, loss_att, loss_ctc, loss_ctc_inter, loss_encoder_bias, loss_decoder_bias = model(
+                            feats, feats_lengths, target, target_lengths, context_list, context_lengths, context_label, context_label_lengths, context_decoder_label)
+                        loss = loss / accum_grad
                     if use_amp:
                         scaler.scale(loss).backward()
                     else:
-                        loss.backward()
+                        
+                        loss.backward(retain_graph=True)
 
                 num_seen_utts += num_utts
                 if batch_idx % accum_grad == 0:
@@ -112,9 +109,16 @@ class Executor:
                     log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
                         epoch, batch_idx,
                         loss.item() * accum_grad)
-                    for name, value in loss_dict.items():
-                        if name != 'loss' and value is not None:
-                            log_str += '{} {:.6f} '.format(name, value.item())
+                    if loss_att is not None:
+                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                    if loss_ctc is not None:
+                        log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
+                    if loss_ctc_inter is not None:
+                        log_str += 'loss_ctc_inter {:.6f} '.format(loss_ctc_inter.item())
+                    if loss_encoder_bias is not None:
+                        log_str += 'loss_encoder_bias {:.6f} '.format(loss_encoder_bias.item())
+                    if loss_decoder_bias is not None:
+                        log_str += 'loss_decoder_bias {:.6f} '.format(loss_decoder_bias.item())
                     log_str += 'lr {:.8f} rank {}'.format(lr, rank)
                     logging.debug(log_str)
 
@@ -128,29 +132,46 @@ class Executor:
         # in order to avoid division by 0
         num_seen_utts = 1
         total_loss = 0.0
+        total_loss_encoder_bias = 0.0
+        total_loss_decoder_bias = 0.0
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
-                key, feats, target, feats_lengths, target_lengths = batch
+                key, feats, target, feats_lengths, target_lengths, context_list, context_lengths, context_label, context_label_lengths, context_decoder_label = batch
                 feats = feats.to(device)
                 target = target.to(device)
                 feats_lengths = feats_lengths.to(device)
                 target_lengths = target_lengths.to(device)
+                context_list = context_list.to(device)
+                context_lengths = context_lengths.to(device)
+                context_label = context_label.to(device)
+                context_label_lengths = context_label_lengths.to(device)
+                context_decoder_label = context_decoder_label.to(device)
                 num_utts = target_lengths.size(0)
                 if num_utts == 0:
                     continue
-                loss_dict = model(feats, feats_lengths, target, target_lengths)
-                loss = loss_dict['loss']
+                loss, loss_att, loss_ctc, loss_ctc_inter, loss_encoder_bias, loss_decoder_bias = model(feats, feats_lengths, target, target_lengths, context_list, context_lengths, context_label, context_label_lengths, context_decoder_label)
                 if torch.isfinite(loss):
                     num_seen_utts += num_utts
                     total_loss += loss.item() * num_utts
+                    if loss_encoder_bias != None:
+                        total_loss_encoder_bias += loss_encoder_bias.item() * num_utts
+                    if loss_decoder_bias != None:
+                        total_loss_decoder_bias += loss_decoder_bias.item() * num_utts
                 if batch_idx % log_interval == 0:
                     log_str = 'CV Batch {}/{} loss {:.6f} '.format(
                         epoch, batch_idx, loss.item())
-                    for name, value in loss_dict.items():
-                        if name != 'loss' and value is not None:
-                            log_str += '{} {:.6f} '.format(name, value.item())
+                    if loss_att is not None:
+                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                    if loss_ctc is not None:
+                        log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
+                    if loss_ctc_inter is not None:
+                        log_str += 'loss_ctc_inter {:.6f} '.format(loss_ctc_inter.item())
+                    if loss_encoder_bias is not None:
+                        log_str += 'loss_encoder_bias {:.6f} '.format(loss_encoder_bias.item())
+                    if loss_decoder_bias is not None:
+                        log_str += 'loss_decoder_bias {:.6f} '.format(loss_decoder_bias.item())
                     log_str += 'history loss {:.6f}'.format(total_loss /
                                                             num_seen_utts)
                     log_str += ' rank {}'.format(rank)
                     logging.debug(log_str)
-        return total_loss, num_seen_utts
+        return total_loss, total_loss_encoder_bias, total_loss_decoder_bias, num_seen_utts

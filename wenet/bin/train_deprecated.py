@@ -1,4 +1,4 @@
-# Copyright (c) 2021 Mobvoi Inc. (authors: Binbin Zhang)
+# Copyright (c) 2020 Mobvoi Inc. (authors: Binbin Zhang, Xiaoyu Chen)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,22 +26,20 @@ import yaml
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from wenet.dataset.dataset import Dataset
+from wenet.dataset.dataset_deprecated import AudioDataset, CollateFunc
 from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import (load_checkpoint, save_checkpoint,
                                     load_trained_modules)
 from wenet.utils.executor import Executor
-from wenet.utils.file_utils import read_symbol_table, read_non_lang_symbols
 from wenet.utils.scheduler import WarmupLR
-from wenet.utils.config import override_config
 
-def get_args():
+if __name__ == '__main__':
+    print("""
+!!! This file is deprecated, and we are planning to remove it in
+the future, please move to the new IO !!!
+    """)
     parser = argparse.ArgumentParser(description='training your network')
     parser.add_argument('--config', required=True, help='config file')
-    parser.add_argument('--data_type',
-                        default='raw',
-                        choices=['raw', 'shard'],
-                        help='train and cv data type')
     parser.add_argument('--train_data', required=True, help='train data file')
     parser.add_argument('--cv_data', required=True, help='cv data file')
     parser.add_argument('--gpu',
@@ -85,28 +83,7 @@ def get_args():
                         action='store_true',
                         default=False,
                         help='Use automatic mixed precision training')
-    parser.add_argument('--fp16_grad_sync',
-                        action='store_true',
-                        default=False,
-                        help='Use fp16 gradient sync for ddp')
     parser.add_argument('--cmvn', default=None, help='global cmvn file')
-    parser.add_argument('--symbol_table',
-                        required=True,
-                        help='model unit symbol table for training')
-    parser.add_argument("--non_lang_syms",
-                        help="non-linguistic symbol file. One symbol per line.")
-    parser.add_argument('--prefetch',
-                        default=100,
-                        type=int,
-                        help='prefetch number')
-    parser.add_argument('--bpe_model',
-                        default=None,
-                        type=str,
-                        help='bpe model for english part')
-    parser.add_argument('--override_config',
-                        action='append',
-                        default=[],
-                        help="override yaml config")
     parser.add_argument("--enc_init",
                         default=None,
                         type=str,
@@ -117,80 +94,81 @@ def get_args():
                         help="List of encoder modules \
                         to initialize ,separated by a comma")
 
-
     args = parser.parse_args()
-    return args
 
-
-def main():
-    args = get_args()
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-
     # Set random seed
     torch.manual_seed(777)
+    print(args)
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
-    if len(args.override_config) > 0:
-        configs = override_config(configs, args.override_config)
 
     distributed = args.world_size > 1
+
+    raw_wav = configs['raw_wav']
+
+    train_collate_func = CollateFunc(**configs['collate_conf'],
+                                     raw_wav=raw_wav)
+
+    cv_collate_conf = copy.deepcopy(configs['collate_conf'])
+    # no augmenation on cv set
+    cv_collate_conf['spec_aug'] = False
+    cv_collate_conf['spec_sub'] = False
+    if raw_wav:
+        cv_collate_conf['feature_dither'] = 0.0
+        cv_collate_conf['speed_perturb'] = False
+        cv_collate_conf['wav_distortion_conf']['wav_distortion_rate'] = 0
+    cv_collate_func = CollateFunc(**cv_collate_conf, raw_wav=raw_wav)
+
+    dataset_conf = configs.get('dataset_conf', {})
+    train_dataset = AudioDataset(args.train_data,
+                                 **dataset_conf,
+                                 raw_wav=raw_wav)
+    cv_dataset = AudioDataset(args.cv_data, **dataset_conf, raw_wav=raw_wav)
+
     if distributed:
         logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))
         dist.init_process_group(args.dist_backend,
                                 init_method=args.init_method,
                                 world_size=args.world_size,
                                 rank=args.rank)
-
-    symbol_table = read_symbol_table(args.symbol_table)
-
-    train_conf = configs['dataset_conf']
-    cv_conf = copy.deepcopy(train_conf)
-    cv_conf['speed_perturb'] = False
-    cv_conf['spec_aug'] = False
-    cv_conf['spec_sub'] = False
-    cv_conf['shuffle'] = False
-    if train_conf['context_mode'] == 0:
-        cv_conf['context_mode'] = 0
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, shuffle=True)
+        cv_sampler = torch.utils.data.distributed.DistributedSampler(
+            cv_dataset, shuffle=False)
     else:
-        cv_conf['context_mode'] = 1
-    non_lang_syms = read_non_lang_symbols(args.non_lang_syms)
-
-    train_dataset = Dataset(args.data_type, args.train_data, symbol_table,
-                            train_conf, args.bpe_model, non_lang_syms, True)
-    cv_dataset = Dataset(args.data_type,
-                         args.cv_data,
-                         symbol_table,
-                         cv_conf,
-                         args.bpe_model,
-                         non_lang_syms,
-                         partition=False)
+        train_sampler = None
+        cv_sampler = None
 
     train_data_loader = DataLoader(train_dataset,
-                                   batch_size=None,
+                                   collate_fn=train_collate_func,
+                                   sampler=train_sampler,
+                                   shuffle=(train_sampler is None),
                                    pin_memory=args.pin_memory,
-                                   num_workers=args.num_workers,
-                                   prefetch_factor=args.prefetch,
-                                   persistent_workers=True)
+                                   batch_size=1,
+                                   num_workers=args.num_workers)
     cv_data_loader = DataLoader(cv_dataset,
-                                batch_size=None,
+                                collate_fn=cv_collate_func,
+                                sampler=cv_sampler,
+                                shuffle=False,
+                                batch_size=1,
                                 pin_memory=args.pin_memory,
-                                num_workers=args.num_workers,
-                                prefetch_factor=args.prefetch,
-                                persistent_workers=True)
+                                num_workers=args.num_workers)
 
-    if 'fbank_conf' in configs['dataset_conf']:
-        input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+    if raw_wav:
+        input_dim = configs['collate_conf']['feature_extraction_conf'][
+            'mel_bins']
     else:
-        input_dim = configs['dataset_conf']['mfcc_conf']['num_mel_bins']
-    vocab_size = len(symbol_table)
+        input_dim = train_dataset.input_dim
+    vocab_size = train_dataset.output_dim
 
     # Save configs to model_dir/train.yaml for inference and export
     configs['input_dim'] = input_dim
     configs['output_dim'] = vocab_size
     configs['cmvn_file'] = args.cmvn
-    configs['is_json_cmvn'] = True
+    configs['is_json_cmvn'] = raw_wav
     if args.rank == 0:
         saved_config_path = os.path.join(args.model_dir, 'train.yaml')
         with open(saved_config_path, 'w') as fout:
@@ -199,38 +177,22 @@ def main():
 
     # Init asr model from configs
     model = init_asr_model(configs)
-    
-    if 'freeze_ori_model' in configs and configs['freeze_ori_model'] == True:
-        print("___________________")
-        print("freeze ori model")
-        for p in model.ctc.parameters():
-            p.requires_grad = False
-        for p in model.decoder.parameters():
-            p.requires_grad = False
-        for layer in model.encoder.encoders:
-            for p in layer.parameters():
-                p.requires_grad = False
-    
-    # print(model)
+    print(model)
     num_params = sum(p.numel() for p in model.parameters())
-    encoder_num_params = sum(p.numel() for p in model.encoder.parameters())
-    decoder_num_params = sum(p.numel() for p in model.decoder.parameters())
     print('the number of model params: {}'.format(num_params))
-    print('the number of encoder params: {}'.format(encoder_num_params))
-    print('the number of decoder params: {}'.format(decoder_num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    #if args.rank == 0:
-    #    script_model = torch.jit.script(model)
-    #    script_model.save(os.path.join(args.model_dir, 'init.zip'))
+    if args.rank == 0:
+        script_model = torch.jit.script(model)
+        script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:
         infos = load_checkpoint(model, args.checkpoint)
     elif args.enc_init is not None:
-        logging.info('load pretrained encoders: {}'.format(args.enc_init))
+        logging.debug('load pretrained encoders: {}'.format(args.enc_init))
         infos = load_trained_modules(model, args)
     else:
         infos = {}
@@ -253,19 +215,12 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, find_unused_parameters=True)
         device = torch.device("cuda")
-        if args.fp16_grad_sync:
-            from torch.distributed.algorithms.ddp_comm_hooks import (
-                default as comm_hooks,
-            )
-            model.register_comm_hook(
-                state=None, hook=comm_hooks.fp16_compress_hook
-            )
     else:
         use_cuda = args.gpu >= 0 and torch.cuda.is_available()
         device = torch.device('cuda' if use_cuda else 'cpu')
         model = model.to(device)
 
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), **configs['optim_conf'])
+    optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
     scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
     final_epoch = None
     configs['rank'] = args.rank
@@ -282,23 +237,28 @@ def main():
     scaler = None
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
-
     for epoch in range(start_epoch, num_epochs):
-        train_dataset.set_epoch(epoch)
-        configs['epoch'] = epoch
+        if distributed:
+            train_sampler.set_epoch(epoch)
         lr = optimizer.param_groups[0]['lr']
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
         executor.train(model, optimizer, scheduler, train_data_loader, device,
                        writer, configs, scaler)
-        total_loss, total_loss_encoder_bias, total_loss_decoder_bias, num_seen_utts = executor.cv(model, cv_data_loader, device,
+        total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
                                                 configs)
-        cv_loss = total_loss / num_seen_utts
-        cv_loss_encoder_bias = total_loss_encoder_bias / num_seen_utts
-        cv_loss_decoder_bias = total_loss_decoder_bias / num_seen_utts
+        if args.world_size > 1:
+            # all_reduce expected a sequence parameter, so we use [num_seen_utts].
+            num_seen_utts = torch.Tensor([num_seen_utts]).to(device)
+            # the default operator in all_reduce function is sum.
+            dist.all_reduce(num_seen_utts)
+            total_loss = torch.Tensor([total_loss]).to(device)
+            dist.all_reduce(total_loss)
+            cv_loss = total_loss[0] / num_seen_utts[0]
+            cv_loss = cv_loss.item()
+        else:
+            cv_loss = total_loss / num_seen_utts
 
-        logging.info('Epoch {} CV info cv_loss {} '.format(epoch, cv_loss))
-        logging.info('cv_loss_encoder_bias {}'.format(cv_loss_encoder_bias))
-        logging.info('cv_loss_decoder_bias {}'.format(cv_loss_decoder_bias))
+        logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
         if args.rank == 0:
             save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
             save_checkpoint(
@@ -306,8 +266,6 @@ def main():
                     'epoch': epoch,
                     'lr': lr,
                     'cv_loss': cv_loss,
-                    'cv_loss_encoder_bias': cv_loss_encoder_bias,
-                    'cv_loss_decoder_bias': cv_loss_decoder_bias,
                     'step': executor.step
                 })
             writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
@@ -318,7 +276,3 @@ def main():
         final_model_path = os.path.join(model_dir, 'final.pt')
         os.symlink('{}.pt'.format(final_epoch), final_model_path)
         writer.close()
-
-
-if __name__ == '__main__':
-    main()
